@@ -1,4 +1,6 @@
-use crate::raw::{Allocator, Bucket, Global, RawDrain, RawIntoIter, RawIter, RawTable};
+use crate::raw::{
+    Allocator, Bucket, Global, NopMoveHook, RawDrain, RawIntoIter, RawIter, RawTable,
+};
 use crate::{Equivalent, TryReserveError};
 use core::borrow::Borrow;
 use core::fmt::{self, Debug};
@@ -2329,7 +2331,7 @@ where
 /// assert_eq!(iter.next(), None);
 /// ```
 pub struct Iter<'a, K, V> {
-    inner: RawIter<(K, V)>,
+    inner: RawIter<(K, V), NopMoveHook>,
     marker: PhantomData<(&'a K, &'a V)>,
 }
 
@@ -2378,7 +2380,7 @@ impl<K: Debug, V: Debug> fmt::Debug for Iter<'_, K, V> {
 /// assert_eq!(map.get(&2).unwrap(), &"Two Mississippi".to_owned());
 /// ```
 pub struct IterMut<'a, K, V> {
-    inner: RawIter<(K, V)>,
+    inner: RawIter<(K, V), NopMoveHook>,
     // To ensure invariance with respect to V
     marker: PhantomData<(&'a K, &'a mut V)>,
 }
@@ -2793,7 +2795,7 @@ impl<K, V, F> FusedIterator for DrainFilter<'_, K, V, F> where F: FnMut(&K, &mut
 
 /// Portions of `DrainFilter` shared with `set::DrainFilter`
 pub(super) struct DrainFilterInner<'a, K, V, A: Allocator + Clone> {
-    pub iter: RawIter<(K, V)>,
+    pub iter: RawIter<(K, V), NopMoveHook>,
     pub table: &'a mut RawTable<(K, V), A>,
 }
 

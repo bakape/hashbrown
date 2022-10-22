@@ -9,6 +9,9 @@ use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 use core::{hint, ptr};
 
+// TODO: run clippy both with and without `move-hook` enabled
+// TODO: go over file and update make sure all moves and inserts are covered
+
 cfg_if! {
     // Use the SSE2 implementation if possible: it allows us to scan 16 buckets
     // at once instead of 8. We don't bother with AVX since it would require
@@ -39,6 +42,9 @@ mod bitmask;
 
 use self::bitmask::{BitMask, BitMaskIter};
 use self::imp::Group;
+
+mod move_hook;
+pub use move_hook::*;
 
 // Branch prediction hint. This is currently only available on nightly but it
 // consistently improves performance by 10-15%.
@@ -367,14 +373,20 @@ impl<T> Bucket<T> {
 }
 
 /// A raw hash table with an unsafe API.
-pub struct RawTable<T, A: Allocator + Clone = Global> {
+pub struct RawTable<T, A = Global, M = NopMoveHook>
+where
+    A: Allocator + Clone,
+    M: MoveHook<T>,
+{
     table: RawTableInner<A>,
     // Tell dropck that we own instances of T.
-    marker: PhantomData<T>,
+    marker: PhantomData<(T, M)>,
 }
 
 /// Non-generic part of `RawTable` which allows functions to be instantiated only once regardless
 /// of how many different key-value types are used.
+//
+// TODO: add M and integrate on all move operations
 struct RawTableInner<A> {
     // Mask to get an index from a hash value. The value is one less than the
     // number of buckets in the table.
@@ -393,7 +405,10 @@ struct RawTableInner<A> {
     alloc: A,
 }
 
-impl<T> RawTable<T, Global> {
+impl<T, M> RawTable<T, Global, M>
+where
+    M: MoveHook<T>,
+{
     /// Creates a new empty hash table without allocating any memory.
     ///
     /// In effect this returns a table with exactly 1 bucket. However we can
@@ -401,10 +416,7 @@ impl<T> RawTable<T, Global> {
     /// due to our load factor forcing us to always have at least 1 free bucket.
     #[inline]
     pub const fn new() -> Self {
-        Self {
-            table: RawTableInner::new_in(Global),
-            marker: PhantomData,
-        }
+        Self::new_in(Global)
     }
 
     /// Attempts to allocate a new hash table with at least enough capacity
@@ -421,7 +433,11 @@ impl<T> RawTable<T, Global> {
     }
 }
 
-impl<T, A: Allocator + Clone> RawTable<T, A> {
+impl<T, A, M> RawTable<T, A, M>
+where
+    A: Allocator + Clone,
+    M: MoveHook<T>,
+{
     const TABLE_LAYOUT: TableLayout = TableLayout::new::<T>();
     const DATA_NEEDS_DROP: bool = mem::needs_drop::<T>();
 
@@ -741,6 +757,7 @@ impl<T, A: Allocator + Clone> RawTable<T, A> {
             self.table.record_item_insert_at(index, old_ctrl, hash);
 
             let bucket = self.bucket(index);
+            M::set_index(&mut value, index);
             bucket.write(value);
             bucket
         }
@@ -759,6 +776,7 @@ impl<T, A: Allocator + Clone> RawTable<T, A> {
             match self.table.prepare_insert_no_grow(hash) {
                 Ok(index) => {
                     let bucket = self.bucket(index);
+                    M::set_index(&mut value, index);
                     bucket.write(value);
                     Ok(bucket)
                 }
@@ -790,6 +808,7 @@ impl<T, A: Allocator + Clone> RawTable<T, A> {
         // the load counter.
         self.table.growth_left -= special_is_empty(old_ctrl) as usize;
 
+        M::set_index(&mut value, index);
         bucket.write(value);
         self.table.items += 1;
         bucket
@@ -815,6 +834,7 @@ impl<T, A: Allocator + Clone> RawTable<T, A> {
             self.table.growth_left = old_growth_left;
             self.table.set_ctrl(index, old_ctrl);
             self.table.items += 1;
+            M::set_index(&mut new_item, index);
             self.bucket(index).write(new_item);
             true
         } else {
@@ -955,11 +975,12 @@ impl<T, A: Allocator + Clone> RawTable<T, A> {
     /// Because we cannot make the `next` method unsafe on the `RawIter`
     /// struct, we have to make the `iter` method unsafe.
     #[inline]
-    pub unsafe fn iter(&self) -> RawIter<T> {
+    pub unsafe fn iter(&self) -> RawIter<T, M> {
         let data = Bucket::from_base_index(self.data_end(), 0);
         RawIter {
             iter: RawIterRange::new(self.table.ctrl.as_ptr(), data, self.table.buckets()),
             items: self.table.items,
+            pd: Default::default(),
         }
     }
 
@@ -981,7 +1002,7 @@ impl<T, A: Allocator + Clone> RawTable<T, A> {
     /// Returns an iterator which removes all elements from the table without
     /// freeing the memory.
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn drain(&mut self) -> RawDrain<'_, T, A> {
+    pub fn drain(&mut self) -> RawDrain<'_, T, A, M> {
         unsafe {
             let iter = self.iter();
             self.drain_iter_from(iter)
@@ -996,7 +1017,7 @@ impl<T, A: Allocator + Clone> RawTable<T, A> {
     /// It is up to the caller to ensure that the iterator is valid for this
     /// `RawTable` and covers all items that remain in the table.
     #[cfg_attr(feature = "inline-more", inline)]
-    pub unsafe fn drain_iter_from(&mut self, iter: RawIter<T>) -> RawDrain<'_, T, A> {
+    pub unsafe fn drain_iter_from(&mut self, iter: RawIter<T, M>) -> RawDrain<'_, T, A, M> {
         debug_assert_eq!(iter.len(), self.len());
         RawDrain {
             iter,
@@ -1012,7 +1033,7 @@ impl<T, A: Allocator + Clone> RawTable<T, A> {
     ///
     /// It is up to the caller to ensure that the iterator is valid for this
     /// `RawTable` and covers all items that remain in the table.
-    pub unsafe fn into_iter_from(self, iter: RawIter<T>) -> RawIntoIter<T, A> {
+    pub unsafe fn into_iter_from(self, iter: RawIter<T, M>) -> RawIntoIter<T, A, M> {
         debug_assert_eq!(iter.len(), self.len());
 
         let alloc = self.table.alloc.clone();
@@ -1048,16 +1069,18 @@ impl<T, A: Allocator + Clone> RawTable<T, A> {
     }
 }
 
-unsafe impl<T, A: Allocator + Clone> Send for RawTable<T, A>
+unsafe impl<T, A, M> Send for RawTable<T, A, M>
 where
     T: Send,
-    A: Send,
+    A: Allocator + Clone + Send,
+    M: MoveHook<T> + Send,
 {
 }
-unsafe impl<T, A: Allocator + Clone> Sync for RawTable<T, A>
+unsafe impl<T, A, M> Sync for RawTable<T, A, M>
 where
     T: Sync,
-    A: Sync,
+    A: Allocator + Clone + Sync,
+    M: MoveHook<T> + Sync,
 {
 }
 
@@ -1403,14 +1426,17 @@ impl<A: Allocator + Clone> RawTableInner<A> {
     /// code generated, but it is eliminated by LLVM optimizations when inlined.
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    unsafe fn reserve_rehash_inner(
+    unsafe fn reserve_rehash_inner<T, M>(
         &mut self,
         additional: usize,
         hasher: &dyn Fn(&mut Self, usize) -> u64,
         fallibility: Fallibility,
         layout: TableLayout,
         drop: Option<fn(*mut u8)>,
-    ) -> Result<(), TryReserveError> {
+    ) -> Result<(), TryReserveError>
+    where
+        M: MoveHook<T>,
+    {
         // Avoid `Option::ok_or_else` because it bloats LLVM IR.
         let new_items = match self.items.checked_add(additional) {
             Some(new_items) => new_items,
@@ -1425,7 +1451,7 @@ impl<A: Allocator + Clone> RawTableInner<A> {
         } else {
             // Otherwise, conservatively resize to at least the next size up
             // to avoid churning deletes into frequent rehashes.
-            self.resize_inner(
+            self.resize_inner::<T, M>(
                 usize::max(new_items, full_capacity + 1),
                 hasher,
                 fallibility,
@@ -1441,13 +1467,16 @@ impl<A: Allocator + Clone> RawTableInner<A> {
     /// code generated, but it is eliminated by LLVM optimizations when inlined.
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    unsafe fn resize_inner(
+    unsafe fn resize_inner<T, M>(
         &mut self,
         capacity: usize,
         hasher: &dyn Fn(&mut Self, usize) -> u64,
         fallibility: Fallibility,
         layout: TableLayout,
-    ) -> Result<(), TryReserveError> {
+    ) -> Result<(), TryReserveError>
+    where
+        M: MoveHook<T>,
+    {
         let mut new_table = self.prepare_resize(layout, capacity, fallibility)?;
 
         // Copy all elements to the new table.
@@ -1470,6 +1499,9 @@ impl<A: Allocator + Clone> RawTableInner<A> {
                 new_table.bucket_ptr(index, layout.size),
                 layout.size,
             );
+            if index != i {
+                M::set_index(new_table.bucket::<T>(index).ptr.as_mut(), index);
+            }
         }
 
         // We successfully copied all elements without panicking. Now replace
@@ -1704,7 +1736,12 @@ impl<T: Clone, A: Allocator + Clone> Clone for RawTable<T, A> {
 trait RawTableClone {
     unsafe fn clone_from_spec(&mut self, source: &Self);
 }
-impl<T: Clone, A: Allocator + Clone> RawTableClone for RawTable<T, A> {
+impl<T, A, M> RawTableClone for RawTable<T, A, M>
+where
+    T: Clone,
+    A: Allocator + Clone,
+    M: MoveHook<T>,
+{
     default_fn! {
         #[cfg_attr(feature = "inline-more", inline)]
         unsafe fn clone_from_spec(&mut self, source: &Self) {
@@ -1713,7 +1750,12 @@ impl<T: Clone, A: Allocator + Clone> RawTableClone for RawTable<T, A> {
     }
 }
 #[cfg(feature = "nightly")]
-impl<T: Copy, A: Allocator + Clone> RawTableClone for RawTable<T, A> {
+impl<T, A, M> RawTableClone for RawTable<T, A, M>
+where
+    T: Copy,
+    A: Allocator + Clone,
+    M: MoveHook<T>,
+{
     #[cfg_attr(feature = "inline-more", inline)]
     unsafe fn clone_from_spec(&mut self, source: &Self) {
         source
@@ -1729,7 +1771,12 @@ impl<T: Copy, A: Allocator + Clone> RawTableClone for RawTable<T, A> {
     }
 }
 
-impl<T: Clone, A: Allocator + Clone> RawTable<T, A> {
+impl<T, A, M> RawTable<T, A, M>
+where
+    T: Clone,
+    A: Allocator + Clone,
+    M: MoveHook<T>,
+{
     /// Common code for clone and clone_from. Assumes:
     /// - `self.buckets() == source.buckets()`.
     /// - Any existing elements have been dropped.
@@ -1836,7 +1883,7 @@ unsafe impl<#[may_dangle] T, A: Allocator + Clone> Drop for RawTable<T, A> {
     }
 }
 #[cfg(not(feature = "nightly"))]
-impl<T, A: Allocator + Clone> Drop for RawTable<T, A> {
+impl<T, A: Allocator + Clone> Drop for RawTable<T, A, M> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn drop(&mut self) {
         if !self.table.is_empty_singleton() {
@@ -1848,7 +1895,7 @@ impl<T, A: Allocator + Clone> Drop for RawTable<T, A> {
     }
 }
 
-impl<T, A: Allocator + Clone> IntoIterator for RawTable<T, A> {
+impl<T, A: Allocator + Clone> IntoIterator for RawTable<T, A, M> {
     type Item = T;
     type IntoIter = RawIntoIter<T, A>;
 
@@ -2028,12 +2075,13 @@ impl<T> FusedIterator for RawIterRange<T> {}
 ///   created will be yielded by that iterator (unless `reflect_insert` is called).
 /// - The order in which the iterator yields bucket is unspecified and may
 ///   change in the future.
-pub struct RawIter<T> {
+pub struct RawIter<T, M> {
     pub(crate) iter: RawIterRange<T>,
     items: usize,
+    pd: PhantomData<M>,
 }
 
-impl<T> RawIter<T> {
+impl<T, M> RawIter<T, M> {
     const DATA_NEEDS_DROP: bool = mem::needs_drop::<T>();
 
     /// Refresh the iterator so that it reflects a removal from the given bucket.
@@ -2161,17 +2209,18 @@ impl<T> RawIter<T> {
     }
 }
 
-impl<T> Clone for RawIter<T> {
+impl<T, M> Clone for RawIter<T, M> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn clone(&self) -> Self {
         Self {
             iter: self.iter.clone(),
             items: self.items,
+            pd: Default::default(),
         }
     }
 }
 
-impl<T> Iterator for RawIter<T> {
+impl<T, M> Iterator for RawIter<T, M> {
     type Item = Bucket<T>;
 
     #[cfg_attr(feature = "inline-more", inline)]
@@ -2200,20 +2249,28 @@ impl<T> Iterator for RawIter<T> {
     }
 }
 
-impl<T> ExactSizeIterator for RawIter<T> {}
-impl<T> FusedIterator for RawIter<T> {}
+impl<T, M> ExactSizeIterator for RawIter<T, M> {}
+impl<T, M> FusedIterator for RawIter<T, M> {}
 
 /// Iterator which consumes a table and returns elements.
-pub struct RawIntoIter<T, A: Allocator + Clone = Global> {
-    iter: RawIter<T>,
+pub struct RawIntoIter<T, A = Global, M = NopMoveHook>
+where
+    A: Allocator + Clone,
+    M: MoveHook<T>,
+{
+    iter: RawIter<T, M>,
     allocation: Option<(NonNull<u8>, Layout)>,
     marker: PhantomData<T>,
     alloc: A,
 }
 
-impl<T, A: Allocator + Clone> RawIntoIter<T, A> {
+impl<T, A, M> RawIntoIter<T, A, M>
+where
+    A: Allocator + Clone,
+    M: MoveHook<T>,
+{
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn iter(&self) -> RawIter<T> {
+    pub fn iter(&self) -> RawIter<T, M> {
         self.iter.clone()
     }
 }
@@ -2232,7 +2289,11 @@ where
 }
 
 #[cfg(feature = "nightly")]
-unsafe impl<#[may_dangle] T, A: Allocator + Clone> Drop for RawIntoIter<T, A> {
+unsafe impl<#[may_dangle] T, A, M> Drop for RawIntoIter<T, A, M>
+where
+    A: Allocator + Clone,
+    M: MoveHook<T>,
+{
     #[cfg_attr(feature = "inline-more", inline)]
     fn drop(&mut self) {
         unsafe {
@@ -2247,7 +2308,11 @@ unsafe impl<#[may_dangle] T, A: Allocator + Clone> Drop for RawIntoIter<T, A> {
     }
 }
 #[cfg(not(feature = "nightly"))]
-impl<T, A: Allocator + Clone> Drop for RawIntoIter<T, A> {
+impl<T, A, M> Drop for RawIntoIter<T, A, M>
+where
+    A: Allocator + Clone,
+    M: MoveHook<T>,
+{
     #[cfg_attr(feature = "inline-more", inline)]
     fn drop(&mut self) {
         unsafe {
@@ -2262,7 +2327,11 @@ impl<T, A: Allocator + Clone> Drop for RawIntoIter<T, A> {
     }
 }
 
-impl<T, A: Allocator + Clone> Iterator for RawIntoIter<T, A> {
+impl<T, A, M> Iterator for RawIntoIter<T, A, M>
+where
+    A: Allocator + Clone,
+    M: MoveHook<T>,
+{
     type Item = T;
 
     #[cfg_attr(feature = "inline-more", inline)]
@@ -2276,41 +2345,61 @@ impl<T, A: Allocator + Clone> Iterator for RawIntoIter<T, A> {
     }
 }
 
-impl<T, A: Allocator + Clone> ExactSizeIterator for RawIntoIter<T, A> {}
-impl<T, A: Allocator + Clone> FusedIterator for RawIntoIter<T, A> {}
+impl<T, A, M> ExactSizeIterator for RawIntoIter<T, A, M>
+where
+    A: Allocator + Clone,
+    M: MoveHook<T>,
+{
+}
+impl<T, A, M> FusedIterator for RawIntoIter<T, A, M>
+where
+    A: Allocator + Clone,
+    M: MoveHook<T>,
+{
+}
 
 /// Iterator which consumes elements without freeing the table storage.
-pub struct RawDrain<'a, T, A: Allocator + Clone = Global> {
-    iter: RawIter<T>,
+pub struct RawDrain<'a, T, A = Global, M = NopMoveHook>
+where
+    A: Allocator + Clone,
+    M: MoveHook<T>,
+{
+    iter: RawIter<T, M>,
 
     // The table is moved into the iterator for the duration of the drain. This
     // ensures that an empty table is left if the drain iterator is leaked
     // without dropping.
-    table: ManuallyDrop<RawTable<T, A>>,
-    orig_table: NonNull<RawTable<T, A>>,
+    table: ManuallyDrop<RawTable<T, A, M>>,
+    orig_table: NonNull<RawTable<T, A, M>>,
 
     // We don't use a &'a mut RawTable<T> because we want RawDrain to be
     // covariant over T.
-    marker: PhantomData<&'a RawTable<T, A>>,
+    marker: PhantomData<&'a RawTable<T, A, M>>,
 }
 
-impl<T, A: Allocator + Clone> RawDrain<'_, T, A> {
+impl<T, A, M> RawDrain<'_, T, A, M>
+where
+    A: Allocator + Clone,
+    M: MoveHook<T>,
+{
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn iter(&self) -> RawIter<T> {
+    pub fn iter(&self) -> RawIter<T, M> {
         self.iter.clone()
     }
 }
 
-unsafe impl<T, A: Allocator + Copy> Send for RawDrain<'_, T, A>
+unsafe impl<T, A, M> Send for RawDrain<'_, T, A, M>
 where
     T: Send,
-    A: Send,
+    A: Allocator + Copy + Send,
+    M: MoveHook<T> + Send,
 {
 }
-unsafe impl<T, A: Allocator + Copy> Sync for RawDrain<'_, T, A>
+unsafe impl<T, A, M> Sync for RawDrain<'_, T, A, M>
 where
     T: Sync,
-    A: Sync,
+    A: Allocator + Copy + Sync,
+    M: MoveHook<T> + Sync,
 {
 }
 
